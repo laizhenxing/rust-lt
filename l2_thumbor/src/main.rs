@@ -19,11 +19,14 @@ use std::{
 use tokio::sync::Mutex;
 use tower::ServiceBuilder;
 use tracing::{info, instrument};
+use image::ImageOutputFormat;
 
 // 引入 protobuf 生成的代码
 mod pb;
+mod engine; 
 
 use pb::*;
+use engine::{Engine, Photon};
 
 // 参数使用 serde 做 Deserialize, axum 会自动识别并解析
 #[derive(Deserialize)]
@@ -68,7 +71,7 @@ async fn generate(
     Path(Params { spec, url }): Path<Params>,
     Extension(cache): Extension<Cache>,
 ) -> Result<(HeaderMap, Vec<u8>), StatusCode> {
-    let spec: ImageSpec = spec
+    let _spec: ImageSpec = spec
         .as_str()
         .try_into()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -79,14 +82,21 @@ async fn generate(
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // TODO: 处理图片
+    let mut engine: Photon = data
+        .try_into()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    engine.apply(&_spec.specs);
+
+    let image = engine.generate(ImageOutputFormat::Jpeg(85));
+
+    info!("Finished processing: image size {}", image.len());
 
     let mut headers = HeaderMap::new();
 
     headers.insert("content-type", HeaderValue::from_static("image/jpeg"));
     
-    Ok((headers, data.to_vec()))
+    Ok((headers, image))
 }
-
 
 #[instrument(level = "info", skip(cache))]
 async fn retrieve_image(url: &str, cache: Cache) -> Result<Bytes> {
