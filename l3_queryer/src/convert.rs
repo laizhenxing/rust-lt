@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use polars::prelude::*;
 use sqlparser::ast::{
     BinaryOperator as SqlBinaryOperator, Expr as SqlExpr,
-    Offset as SqlOffset, orderByExpr, Select, SelectItem,
+    Offset as SqlOffset, OrderByExpr, Select, SelectItem,
     SetExpr, Statement, TableFactor, TableWithJoins, Value as SqlValue,
 };
 
@@ -33,7 +33,7 @@ impl<'a> TryFrom<&'a Statement> for Sql<'a> {
     fn try_from(sql: &'a Statement) -> Result<Self, Self::Error> {
         match sql {
             // 目前只关心 query
-            Statement: Query(q) => {
+            Statement::Query(q) => {
                 let offset = q.offset.as_ref();
                 let limit = q.limit.as_ref();
                 let orders = &q.order_by;
@@ -41,23 +41,24 @@ impl<'a> TryFrom<&'a Statement> for Sql<'a> {
                     from: table_with_joins,
                     selection: where_clause,
                     projection,
+
                     group_by: _,
                     ..
                 } = match &q.body {
-                    SetExpr::Select(statment) => statement.as_ref(),
+                    SetExpr::Select(statement) => statement.as_ref(),
                     _ => return Err(anyhow!("We only support Select Query at the moment."))
                 };
 
-                let source = Source(table_with_joins).try_into();
+                let source = Source(table_with_joins).try_into()?;
 
                 let condition = match where_clause {
                     Some(expr) => Some(Expression(Box::new(expr.to_owned())).try_into()?),
                     None => None,
                 };
 
-                let mu t selection = Vec::with_capaciry(8);
+                let mut selection = Vec::with_capacity(8);
                 for p in projection {
-                    let expr = Projection(p).try_into();
+                    let expr = Projection(p).try_into()?;
                     selection.push(expr);
                 }
 
@@ -66,7 +67,7 @@ impl<'a> TryFrom<&'a Statement> for Sql<'a> {
                     order_by.push(Order(expr).try_into()?);
                 }
 
-                let offset = offset.map(|v| Offset(v),into());
+                let offset = offset.map(|v| Offset(v).into());
                 let limit = limit.map(|v| Limit(v).into());
 
                 Ok(Sql {
@@ -125,5 +126,125 @@ impl TryFrom<Operation> for Operator {
             SqlBinaryOperator::Or => Ok(Self::Or),
             v => Err(anyhow!("Operator {} is not supported!", v)),
         }
+    }
+}
+
+// 把 SqlParser 的 SelectItem 转换成 DataFrame 的 Expr
+impl<'a> TryFrom<Projection<'a>> for Expr {
+    type Error = anyhow::Error;
+
+    fn try_from(p: Projection<'a>) -> Result<Self, Self::Error> {
+        match p.0 {
+            SelectItem::UnnamedExpr(SqlExpr::Identifier(id)) => Ok(col(&id.to_string())),
+            SelectItem::ExprWithAlias {
+                expr: SqlExpr::Identifier(id),
+                alias,
+            } => Ok(Expr::Alias(
+                Box::new(Expr::Column(Arc::new(id.to_string()))),
+                Arc::new(alias.to_string()),
+            )),
+            SelectItem::QualifiedWildcard(v) => Ok(col(&v.to_string())),
+            SelectItem::Wildcard => Ok(col("*")),
+            item => Err(anyhow!("projection {} not supported", item)),
+        }
+    }
+}
+
+impl<'a> TryFrom<Source<'a>> for &'a str {
+    type Error = anyhow::Error;
+
+    fn try_from(source: Source<'a>) -> Result<Self, Self::Error> {
+        if source.0.len() != 1 {
+            return Err(anyhow!("We only support single data source the moment."));
+        }
+
+        let table = &source.0[0];
+        if !table.joins.is_empty() {
+            return Err(anyhow!("We do not support join data source the moment."));
+        }
+
+        match &table.relation {
+            TableFactor::Table { name, .. } => Ok(&name.0.first().unwrap().value),
+            _ => Err(anyhow!("We only support table")),
+        }
+    }
+}
+
+// 把 SqlParser 的 order by expr 转换成（列名，排序方法）
+impl<'a> TryFrom<Order<'a>> for (String, bool) {
+    type Error = anyhow::Error;
+
+    fn try_from(o: Order) -> Result<Self, Self::Error> {
+        let name = match &o.0.expr {
+            SqlExpr::Identifier(id) => id.to_string(),
+            expr => {
+                return Err(anyhow!(
+                    "We only support identifier for order by, got {}",
+                    expr
+                ))
+            }
+        };
+
+        Ok((name, !o.0.asc.unwrap_or(true)))
+    }
+}
+
+// 把 SqlParser 的 offset expr 转换成 i64
+impl<'a> From<Offset<'a>> for i64 {
+    fn from(offset: Offset) -> Self {
+        match offset.0 {
+            SqlOffset {
+                value: SqlExpr::Value(SqlValue::Number(v, _b)),
+                ..
+            } => v.parse().unwrap_or(0),
+            _ => 0,
+        }
+    }
+}
+
+// 把 SqlParser 的 limit expr 转换成 usize
+impl<'a> From<Limit<'a>> for usize {
+    fn from(l: Limit<'a>) -> Self {
+        match l.0 {
+            SqlExpr::Value(SqlValue::Number(v, _b)) => v.parse().unwrap_or(usize::MAX),
+            _ => usize::MAX,
+        }
+    }
+}
+
+// 把 SqlParser 的 value 转换成 DataFrame 支持的 LiteralValue
+impl TryFrom<Value> for LiteralValue {
+    type Error = anyhow::Error;
+
+    fn try_from(v: Value) -> Result<Self, Self::Error> {
+        match v.0 {
+            SqlValue::Number(v, _) => Ok(LiteralValue::Float64(v.parse().unwrap())),
+            SqlValue::Boolean(v) => Ok(LiteralValue::Boolean(v)),
+            SqlValue::Null => Ok(LiteralValue::Null),
+            v => Err(anyhow!("Value {} is not supported.", v)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::XlDialect;
+    use sqlparser::parser::Parser;
+
+    #[test]
+    fn parse_sql_works() {
+        let url = "http://abc.xyz/abc?a=1&b=4";
+        let sql = format!(
+            "select a, b, c from {} where a=1 order by c desc limit 5 offset 10",
+            url
+        );
+        let statement = &Parser::parse_sql(&XlDialect::default(), sql.as_ref()).unwrap()[0];
+        let sql: Sql = statement.try_into().unwrap();
+        assert_eq!(sql.soure, url);
+        assert_eq!(sql.limit, Some(5));
+        assert_eq!(sql.offset, Some(10));
+        assert_eq!(sql.order_by, vec![("c".into(), true)]);
+        assert_eq!(sql.selection, vec![col("a", col("b"), col("c"))]);
     }
 }
